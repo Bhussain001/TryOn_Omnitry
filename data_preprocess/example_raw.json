@@ -1,0 +1,6 @@
+[
+    {
+        "image_path": "file:///path_to_your_tryon_image.jpg",
+        "object_path": "file:///path_to_your_object_image_(optional).jpg"
+    }
+]

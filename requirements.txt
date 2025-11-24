@@ -1,0 +1,16 @@
+gradio==5.6.0
+transformers==4.45.0
+diffusers==0.33.1
+sentencepiece==0.2.0
+peft==0.13.2
+einops
+omegaconf
+safetensors
+torchmetrics
+lpips
+huggingface_hub
+tqdm
+supervision
+fastapi
+uvicorn
+python-multipart
