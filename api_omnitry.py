@@ -6,25 +6,27 @@ import torch
 import copy
 import numpy as np
 import torchvision.transforms as T
+import logging
 from fastapi import FastAPI, File, UploadFile, Query, HTTPException
 from fastapi.responses import JSONResponse
 from PIL import Image
-from diffusers import FluxPipeline  # Fallback if needed; actual uses custom
 from peft import LoraConfig
 from safetensors import safe_open
 from omegaconf import OmegaConf
 import os
-os.environ["GRADIO_TEMP_DIR"] = ".gradio"  # Retained for compat
+os.environ["GRADIO_TEMP_DIR"] = ".gradio"
 
-# Custom imports from repo
+# Custom imports
 from omnitry.models.transformer_flux import FluxTransformer2DModel
 from omnitry.pipelines.pipeline_flux_fill import FluxFillPipeline
 
-app = FastAPI(title="OmniTry API", description="Fast Virtual Try-On for Mobile")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Globals (optimized)
+app = FastAPI(title="OmniTry API")
+
 device = torch.device('cuda:0')
-weight_dtype = torch.float16  # Faster than bfloat16; adjust if needed
+weight_dtype = torch.bfloat16
 args = OmegaConf.load('configs/omnitry_v1_unified.yaml')
 pipeline = None
 transformer = None
@@ -37,45 +39,73 @@ def seed_everything(seed=0):
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-def generate(person_image, object_image, object_class, steps=10, guidance_scale=7.5, seed=-1):
+def generate(person_image, object_image, object_class, steps=20, guidance_scale=30, seed=-1):
+    logger.info(f"Starting generate: class={object_class}, steps={steps}, guidance={guidance_scale}")
+    
     if seed == -1:
         seed = random.randint(0, 2**32 - 1)
     seed_everything(seed)
 
-    # Optimized fixed resize (faster than dynamic; common for try-on)
-    fixed_size = (512, 768)
-    transform = T.Compose([T.Resize(fixed_size), T.ToTensor()])
-    person_image = transform(person_image)
+    # Original dynamic resize (quality-preserving)
+    max_area = 1024 * 1024
+    oW = person_image.width
+    oH = person_image.height
+    ratio = math.sqrt(max_area / (oW * oH))
+    ratio = min(1, ratio)
+    tW, tH = int(oW * ratio) // 16 * 16, int(oH * ratio) // 16 * 16
+    transform = T.Compose([T.Resize((tH, tW)), T.ToTensor()])
+    person_tensor = transform(person_image)
+    logger.info(f"Person tensor shape: {person_tensor.shape}, mean: {person_tensor.mean().item():.3f}")
 
-    # Simplified object resize/pad
-    o_transform = T.Compose([T.Resize((256, 256)), T.ToTensor()])  # Fixed for speed
-    object_image = o_transform(object_image)
-    object_image_padded = torch.nn.functional.interpolate(
-        object_image.unsqueeze(0), size=fixed_size, mode='bilinear', align_corners=False
-    ).squeeze(0)
-    object_image_padded = torch.clamp(object_image_padded, 0, 1)  # Normalize
+    # Original object resize and padding
+    ratio = min(tW / object_image.width, tH / object_image.height)
+    transform = T.Compose([
+        T.Resize((int(object_image.height * ratio), int(object_image.width * ratio))),
+        T.ToTensor(),
+    ])
+    object_image_padded = torch.ones_like(person_tensor)
+    object_tensor = transform(object_image)
+    new_h, new_w = object_tensor.shape[1], object_tensor.shape[2]
+    min_x = (tW - new_w) // 2
+    min_y = (tH - new_h) // 2
+    object_image_padded[:, min_y: min_y + new_h, min_x: min_x + new_w] = object_tensor
+    logger.info(f"Object padded shape: {object_image_padded.shape}, mean: {object_image_padded.mean().item():.3f}")
 
     # Prompts & conditions
     prompts = [args.object_map[object_class]] * 2
-    img_cond = torch.stack([person_image, object_image_padded]).to(dtype=weight_dtype, device=device)
+    logger.info(f"Prompts: {prompts}")
+    img_cond = torch.stack([person_tensor, object_image_padded]).to(dtype=weight_dtype, device=device)
     mask = torch.zeros_like(img_cond).to(img_cond)
+    logger.info(f"img_cond shape: {img_cond.shape}, mask shape: {mask.shape}")
 
-    with torch.no_grad():
-        img = pipeline(
-            prompt=prompts,
-            height=fixed_size[1], width=fixed_size[0],
-            img_cond=img_cond, mask=mask,
-            guidance_scale=guidance_scale,
-            num_inference_steps=steps,
-            generator=torch.Generator(device).manual_seed(seed),
-        ).images[0]
+    try:
+        with torch.no_grad():
+            output = pipeline(
+                prompt=prompts,
+                height=tH, width=tW,
+                img_cond=img_cond, mask=mask,
+                guidance_scale=guidance_scale,
+                num_inference_steps=steps,
+                generator=torch.Generator(device).manual_seed(seed),
+            )
+            img = output.images[0]
+        
+        logger.info(f"Generated img shape: {img.size}, tensor mean: {torch.from_numpy(np.array(img)).mean().item():.3f}")
+        
+        # Check for black
+        img_array = np.array(img)
+        if img_array.max() < 1e-5:
+            raise ValueError("Generated image is all black/zero—check inputs or model")
+        
+        return img
+    except Exception as e:
+        logger.error(f"Pipeline error: {str(e)}")
+        raise
 
-    return img
-
+# load_model function (unchanged from previous)
 @app.on_event("startup")
 async def load_model():
     global pipeline, transformer
-    # Exact loading from demo
     transformer = FluxTransformer2DModel.from_pretrained(
         f'{args.model_root}/transformer'
     ).requires_grad_(False).to(dtype=weight_dtype)
@@ -84,11 +114,9 @@ async def load_model():
         args.model_root, transformer=transformer.eval(), torch_dtype=weight_dtype
     )
 
-    # VRAM optimizations
     pipeline.enable_model_cpu_offload()
     pipeline.vae.enable_tiling()
 
-    # LoRA setup (exact)
     lora_config = LoraConfig(
         r=args.lora_rank,
         lora_alpha=args.lora_alpha,
@@ -107,7 +135,6 @@ async def load_model():
         lora_weights = {k: f.get_tensor(k) for k in f.keys()}
         transformer.load_state_dict(lora_weights, strict=False)
 
-    # Hacked LoRA forward (exact)
     def create_hacked_forward(module):
         def lora_forward(self, active_adapter, x, *args, **kwargs):
             result = self.base_layer(x, *args, **kwargs)
@@ -130,22 +157,23 @@ async def load_model():
         return hacked_lora_forward.__get__(module, type(module))
 
     for n, m in transformer.named_modules():
-        if hasattr(m, 'forward') and 'lora' in str(type(m)):  # Simplified check
+        if hasattr(m, 'forward') and 'lora' in str(type(m)):
             m.forward = create_hacked_forward(m)
+
+    logger.info("Model loaded successfully")
 
 @app.post("/tryon")
 async def try_on(
-    person_image: UploadFile = File(..., description="Person image (JPEG/PNG)"),
-    object_image: UploadFile = File(..., description="Object/garment image"),
-    object_class: str = Query(..., description="Class e.g., 'top clothes'"),
-    steps: int = Query(10, ge=5, le=30),
-    guidance_scale: float = Query(7.5, ge=1.0, le=50.0),
+    person_image: UploadFile = File(...),
+    object_image: UploadFile = File(...),
+    object_class: str = Query(...),
+    steps: int = Query(20, ge=5, le=50),  # Higher default for quality
+    guidance_scale: float = Query(30, ge=1.0, le=50.0),  # Higher for adherence
     seed: int = Query(-1)
 ):
     if pipeline is None:
         raise HTTPException(status_code=500, detail="Model not loaded")
 
-    # Load/validate images
     try:
         person_pil = Image.open(io.BytesIO(await person_image.read())).convert("RGB")
         object_pil = Image.open(io.BytesIO(await object_image.read())).convert("RGB")
@@ -153,16 +181,22 @@ async def try_on(
         raise HTTPException(status_code=400, detail=f"Invalid image: {str(e)}")
 
     if object_class not in args.object_map:
-        raise HTTPException(status_code=400, detail=f"Invalid class: {object_class}. Use: {list(args.object_map.keys())}")
+        raise HTTPException(status_code=400, detail=f"Invalid class: {object_class}. Options: {list(args.object_map.keys())}")
 
     try:
         output_img = generate(person_image=person_pil, object_image=object_pil, object_class=object_class,
                               steps=steps, guidance_scale=guidance_scale, seed=seed)
         
-        # Base64 encode for mobile
         buffered = io.BytesIO()
-        output_img.save(buffered, format="PNG", optimize=True)  # Optimize for size/speed
-        img_str = base64.b64encode(buffered.getvalue()).decode()
+        output_img.save(buffered, format="PNG", optimize=False)  # No optimize for max quality
+        buffered.seek(0)
+        img_bytes = buffered.read()
+        
+        logger.info(f"Output PNG size: {len(img_bytes)} bytes")
+        if len(img_bytes) < 10000:  # Adjusted threshold for larger files
+            raise ValueError("Output PNG too small—generation failed")
+        
+        img_str = base64.b64encode(img_bytes).decode()
 
         return {
             "success": True,
@@ -170,7 +204,11 @@ async def try_on(
             "width": output_img.width,
             "height": output_img.height
         }
+    except ValueError as ve:
+        logger.warning(f"Value error: {str(ve)}")
+        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Generation error: {str(e)}")
 
 @app.get("/health")
