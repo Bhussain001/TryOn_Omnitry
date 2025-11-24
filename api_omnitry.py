@@ -217,4 +217,11 @@ async def health():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    uvicorn.run(
+        "api_omnitry:app",
+        host="0.0.0.0",
+        port=8000,
+        timeout_keep_alive=600,  # 10 min
+        limit_max_requests=1000,
+        log_level="info"
+    )
