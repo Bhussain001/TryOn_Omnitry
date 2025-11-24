@@ -90,18 +90,21 @@ def generate(person_image, object_image, object_class, steps=20, guidance_scale=
             )
             img = output.images[0]
         
-        logger.info(f"Generated img shape: {img.size}, tensor mean: {torch.from_numpy(np.array(img)).mean().item():.3f}")
-        
-        # Check for black
+        # Fixed: Normalize to float before mean()
         img_array = np.array(img)
-        if img_array.max() < 1e-5:
+        img_tensor = torch.from_numpy(img_array.astype(np.float32) / 255.0)  # 0-1 range
+        img_mean = img_tensor.mean().item()
+        logger.info(f"Generated img shape: {img.size}, tensor mean: {img_mean:.3f}")
+        
+        # Check for black (using NumPy for speed)
+        if np.mean(img_array) < 1:  # Threshold: all-black ~0
             raise ValueError("Generated image is all black/zero—check inputs or model")
         
         return img
     except Exception as e:
         logger.error(f"Pipeline error: {str(e)}")
         raise
-
+    
 # load_model function (unchanged from previous)
 @app.on_event("startup")
 async def load_model():
