@@ -86,7 +86,7 @@ def generate(person_image, object_image, object_class, steps=10, guidance_scale=
 
     try:
         with torch.no_grad():
-            # Fix: Pass as dict for explicit padding (Diffusers-compatible)
+            # Fix: Remove padding/truncation kwargs (custom pipeline doesn't support them)
             output = pipeline(
                 prompt=prompts,
                 height=tH, width=tW,
@@ -94,8 +94,6 @@ def generate(person_image, object_image, object_class, steps=10, guidance_scale=
                 guidance_scale=guidance_scale,
                 num_inference_steps=steps,
                 generator=torch.Generator(device).manual_seed(seed),
-                padding=True,  # New: Force tokenizer padding
-                truncation=True,  # New: Force truncation to avoid length issues
             )
             img = output.images[0]
         
@@ -119,7 +117,7 @@ def generate(person_image, object_image, object_class, steps=10, guidance_scale=
         if "input_ids" in str(e):
             logger.error(f"Tokenization debug - prompts: {prompts}, types: {[type(p) for p in prompts]}")
         raise
-
+    
 # Updated load_model with extra optimizations
 @app.on_event("startup")
 async def load_model():
