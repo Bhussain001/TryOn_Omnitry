@@ -20,8 +20,6 @@ from scipy.ndimage import distance_transform_edt
 import sys, os; sys.path.append(os.getcwd())
 from diffusers import FluxFillPipeline, FluxImg2ImgPipeline
 
-# New: Allocator config for VRAM efficiency
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:128"
 
 def seed_everything(seed=0):
     random.seed(seed)
@@ -45,17 +43,12 @@ def dilate_mask_process(mask, kernel_size=12, iterations=5):
 
 
 device = torch.device('cuda:0')
-weight_dtype = torch.float16  # Changed: Lower mem than bfloat16
+weight_dtype = torch.bfloat16
 
 # init fill model
 model_root = 'black-forest-labs/FLUX.1-Fill-dev'
 pipeline_fill = FluxFillPipeline.from_pretrained(model_root, torch_dtype=weight_dtype).to(device)
 pipeline_fill.enable_vae_tiling()
-pipeline_fill.enable_vae_slicing()  # New: Extra VAE offload
-# pipeline_fill.enable_xformers_memory_efficient_attention()  # Uncomment if xformers installed
-
-# Optional: Compile for mem efficiency (PyTorch 2.4+)
-pipeline_fill = torch.compile(pipeline_fill, mode="reduce-overhead")
 
 # load lora
 remove_lora_ckpt_path = '../checkpoints/omnitry_remove_objects_lora.safetensors' # download from https://huggingface.co/Kunbyte/OmniTry/
@@ -85,22 +78,16 @@ with safe_open(remove_lora_ckpt_path, framework="pt") as f:
 # init img2img
 model_root = 'black-forest-labs/FLUX.1-dev'
 pipeline_img2img = FluxImg2ImgPipeline.from_pretrained(model_root, torch_dtype=weight_dtype).to(device)
-pipeline_img2img.enable_vae_tiling()
-pipeline_img2img.enable_vae_slicing()  # New
-# pipeline_img2img.enable_xformers_memory_efficient_attention()  # Uncomment if installed
-
-# Optional: Compile
-pipeline_img2img = torch.compile(pipeline_img2img, mode="reduce-overhead")
 
 
-def remove_garment(image_paths, mask_paths, steps=10, guidance_scale=3.5):  # Lowered defaults for speed/mem
+def remove_garment(image_paths, mask_paths):
 
     img_conds, dilate_masks, origin_masks = [], [], []
     for image_path, mask_path in zip(image_paths, mask_paths):
         tryon_img = Image.open(image_path)
         mask = Image.open(mask_path)
 
-        max_area = 512 * 512  # Capped: Reduced from 1024*1024 for ~50% less mem
+        max_area = 1024 * 1024
         oH = tryon_img.height
         oW = tryon_img.width
         ratio = math.sqrt(max_area / (oW * oH))
@@ -134,21 +121,21 @@ def remove_garment(image_paths, mask_paths, steps=10, guidance_scale=3.5):  # Lo
         mask_image=dilate_masks,
         height=img_conds.size(2),
         width=img_conds.size(3),
-        guidance_scale=guidance_scale,  # Tunable
-        num_inference_steps=steps,  # Tunable
+        guidance_scale=30,
+        num_inference_steps=20,
         generator=torch.Generator(device).manual_seed(0)
     ).images
     result_imgs = torch.cat([T.ToTensor()(img)[None] for img in result_imgs], dim=0)
 
-    # img2img refine (lowered strength/steps for mem)
+    # img2img refine
     result_imgs_refined = pipeline_img2img(
         prompt=['a model'] * len(img_conds),
         image=result_imgs,
         strength=0.2,
         height=img_conds.size(2),
         width=img_conds.size(3),
-        guidance_scale=guidance_scale / 10,  # Lower for refine
-        num_inference_steps=steps,
+        guidance_scale=3.5,
+        num_inference_steps=20,
         generator=torch.Generator(device).manual_seed(0)
     ).images
     result_imgs_refined = torch.cat([T.ToTensor()(img)[None] for img in result_imgs_refined], dim=0)
@@ -183,10 +170,6 @@ def remove_garment(image_paths, mask_paths, steps=10, guidance_scale=3.5):  # Lo
         model_img = result_img_refined
         model_imgs.append(model_img)
 
-    # Cleanup after generation
-    del img_conds, dilate_masks, origin_masks, result_imgs, result_imgs_refined
-    torch.cuda.empty_cache()
-
     return tryon_imgs, model_imgs
 
 
@@ -211,13 +194,10 @@ if __name__ == '__main__':
             index['objects'][i]['tryon'] = new_tryon_path
             index['objects'][i]['remove'] = remove_path
 
-            tryon_imgs, model_imgs = remove_garment([image_path], [mask_path], steps=10, guidance_scale=3.5)  # Tunable params
+            tryon_imgs, model_imgs = remove_garment([image_path], [mask_path])
             torchvision.utils.save_image(tryon_imgs[0], new_tryon_path)
             torchvision.utils.save_image(model_imgs[0], remove_path)
             outs.append(index)
-
-            # Per-iteration cleanup
-            torch.cuda.empty_cache()
 
     # save
     with open(output_index_file, 'w+') as f:
