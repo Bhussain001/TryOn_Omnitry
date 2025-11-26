@@ -76,14 +76,17 @@ def generate(person_image, object_image, object_class, steps=10, guidance_scale=
     logger.info(f"Object padded shape: {object_image_padded.shape}, mean: {object_image_padded.mean().item():.3f}")
 
     # Prompts & conditions
-    prompts = [args.object_map[object_class]] * 2
-    logger.info(f"Prompts: {prompts}")
+    prompt_str = args.object_map[object_class]
+    prompts = [prompt_str] * 2  # Ensure it's flat list of str
+    logger.info(f"Prompts type: {type(prompts)}, len: {len(prompts)}, content: {prompts}")  # Debug nesting
+    
     img_cond = torch.stack([person_tensor, object_image_padded]).to(dtype=weight_dtype, device=device)
     mask = torch.zeros_like(img_cond).to(img_cond)
     logger.info(f"img_cond shape: {img_cond.shape}, mask shape: {mask.shape}")
 
     try:
         with torch.no_grad():
+            # Fix: Pass as dict for explicit padding (Diffusers-compatible)
             output = pipeline(
                 prompt=prompts,
                 height=tH, width=tW,
@@ -91,6 +94,8 @@ def generate(person_image, object_image, object_class, steps=10, guidance_scale=
                 guidance_scale=guidance_scale,
                 num_inference_steps=steps,
                 generator=torch.Generator(device).manual_seed(seed),
+                padding=True,  # New: Force tokenizer padding
+                truncation=True,  # New: Force truncation to avoid length issues
             )
             img = output.images[0]
         
@@ -110,6 +115,9 @@ def generate(person_image, object_image, object_class, steps=10, guidance_scale=
         return img
     except Exception as e:
         logger.error(f"Pipeline error: {str(e)}")
+        # Debug: Log if tokenization-related
+        if "input_ids" in str(e):
+            logger.error(f"Tokenization debug - prompts: {prompts}, types: {[type(p) for p in prompts]}")
         raise
 
 # Updated load_model with extra optimizations
@@ -197,9 +205,8 @@ async def load_model():
                 m.forward = create_hacked_forward(m)
         logger.info("Hacks applied")
 
-        # New: Compile pipeline for mem efficiency (PyTorch 2.4+)
-        pipeline = torch.compile(pipeline, mode="reduce-overhead")  # ~20% mem savings; test for stability
-
+        # New: Compile pipeline for mem efficiency (PyTorch 2.4+) - COMMENTED for debugging tokenization
+        # pipeline = torch.compile(pipeline, mode="reduce-overhead")  # ~20% mem savings; test for stability
         logger.info("Model fully loaded—ready for inference!")
     except Exception as e:
         logger.error(f"Load failed: {e}. Verify paths: {args.model_root}, {args.lora_path}")
