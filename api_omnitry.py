@@ -17,6 +17,8 @@ import os
 os.environ["GRADIO_TEMP_DIR"] = ".gradio"
 # New: Allocator config
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:128"
+# New: Force offline/local loading
+os.environ["HF_OFFLINE"] = "1"
 
 # Custom imports
 from omnitry.models.transformer_flux import FluxTransformer2DModel
@@ -114,71 +116,94 @@ def generate(person_image, object_image, object_class, steps=10, guidance_scale=
 @app.on_event("startup")
 async def load_model():
     global pipeline, transformer
-    transformer = FluxTransformer2DModel.from_pretrained(
-        f'{args.model_root}/transformer'
-    ).requires_grad_(False).to(dtype=weight_dtype)
+    try:
+        logger.info("Starting local model load (offline mode)...")
+        
+        # Absolute paths if relative fails (uncomment/adjust)
+        # args.model_root = os.path.abspath(args.model_root)
+        # args.lora_path = os.path.abspath(args.lora_path)
+        
+        transformer = FluxTransformer2DModel.from_pretrained(
+            f'{args.model_root}/transformer',
+            torch_dtype=weight_dtype,
+            low_cpu_mem_usage=True,  # New: Reduces RAM during load
+            resume_download=False,   # New: No net retry; pure local
+            local_files_only=True,  # New: Enforce no remote
+        ).requires_grad_(False).to(dtype=weight_dtype)
+        logger.info("Transformer loaded (shards complete)")
 
-    pipeline = FluxFillPipeline.from_pretrained(
-        args.model_root, transformer=transformer.eval(), torch_dtype=weight_dtype
-    )
+        pipeline = FluxFillPipeline.from_pretrained(
+            args.model_root,
+            transformer=transformer.eval(),
+            torch_dtype=weight_dtype,
+            low_cpu_mem_usage=True,
+            resume_download=False,
+            local_files_only=True,
+        )
+        logger.info("Pipeline base loaded")
 
-    # Enhanced offloads
-    pipeline.enable_model_cpu_offload()
-    pipeline.vae.enable_tiling()
-    pipeline.enable_vae_slicing()  # New: Slices VAE for ~500MB savings
+        # Enhanced offloads
+        pipeline.enable_model_cpu_offload()
+        pipeline.vae.enable_tiling()
+        pipeline.enable_vae_slicing()  # New: Slices VAE for ~500MB savings
 
-    # Optional: xFormers (uncomment if installed)
-    # pipeline.enable_xformers_memory_efficient_attention()
+        # Optional: xFormers (uncomment if installed)
+        # pipeline.enable_xformers_memory_efficient_attention()
 
-    # LoRA setup (unchanged)
-    lora_config = LoraConfig(
-        r=args.lora_rank,
-        lora_alpha=args.lora_alpha,
-        init_lora_weights="gaussian",
-        target_modules=[
-            'x_embedder', 'attn.to_k', 'attn.to_q', 'attn.to_v', 'attn.to_out.0',
-            'attn.add_k_proj', 'attn.add_q_proj', 'attn.add_v_proj', 'attn.to_add_out',
-            'ff.net.0.proj', 'ff.net.2', 'ff_context.net.0.proj', 'ff_context.net.2',
-            'norm1_context.linear', 'norm1.linear', 'norm.linear', 'proj_mlp', 'proj_out'
-        ]
-    )
-    transformer.add_adapter(lora_config, adapter_name='vtryon_lora')
-    transformer.add_adapter(lora_config, adapter_name='garment_lora')
+        # LoRA setup (unchanged)
+        lora_config = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            init_lora_weights="gaussian",
+            target_modules=[
+                'x_embedder', 'attn.to_k', 'attn.to_q', 'attn.to_v', 'attn.to_out.0',
+                'attn.add_k_proj', 'attn.add_q_proj', 'attn.add_v_proj', 'attn.to_add_out',
+                'ff.net.0.proj', 'ff.net.2', 'ff_context.net.0.proj', 'ff_context.net.2',
+                'norm1_context.linear', 'norm1.linear', 'norm.linear', 'proj_mlp', 'proj_out'
+            ]
+        )
+        transformer.add_adapter(lora_config, adapter_name='vtryon_lora')
+        transformer.add_adapter(lora_config, adapter_name='garment_lora')
 
-    with safe_open(args.lora_path, framework="pt") as f:
-        lora_weights = {k: f.get_tensor(k) for k in f.keys()}
-        transformer.load_state_dict(lora_weights, strict=False)
+        with safe_open(args.lora_path, framework="pt") as f:
+            lora_weights = {k: f.get_tensor(k) for k in f.keys()}
+            transformer.load_state_dict(lora_weights, strict=False)
+        logger.info("LoRA applied")
 
-    # Hacked forward (unchanged)
-    def create_hacked_forward(module):
-        def lora_forward(self, active_adapter, x, *args, **kwargs):
-            result = self.base_layer(x, *args, **kwargs)
-            if active_adapter is not None:
-                torch_result_dtype = result.dtype
-                lora_A = self.lora_A[active_adapter]
-                lora_B = self.lora_B[active_adapter]
-                dropout = self.lora_dropout[active_adapter]
-                scaling = self.scaling[active_adapter]
-                x = x.to(lora_A.weight.dtype)
-                result = result + lora_B(lora_A(dropout(x))) * scaling
-            return result
+        # Hacked forward (unchanged)
+        def create_hacked_forward(module):
+            def lora_forward(self, active_adapter, x, *args, **kwargs):
+                result = self.base_layer(x, *args, **kwargs)
+                if active_adapter is not None:
+                    torch_result_dtype = result.dtype
+                    lora_A = self.lora_A[active_adapter]
+                    lora_B = self.lora_B[active_adapter]
+                    dropout = self.lora_dropout[active_adapter]
+                    scaling = self.scaling[active_adapter]
+                    x = x.to(lora_A.weight.dtype)
+                    result = result + lora_B(lora_A(dropout(x))) * scaling
+                return result
 
-        def hacked_lora_forward(self, x, *args, **kwargs):
-            return torch.cat((
-                lora_forward(self, 'vtryon_lora', x[:1], *args, **kwargs),
-                lora_forward(self, 'garment_lora', x[1:], *args, **kwargs),
-            ), dim=0)
+            def hacked_lora_forward(self, x, *args, **kwargs):
+                return torch.cat((
+                    lora_forward(self, 'vtryon_lora', x[:1], *args, **kwargs),
+                    lora_forward(self, 'garment_lora', x[1:], *args, **kwargs),
+                ), dim=0)
 
-        return hacked_lora_forward.__get__(module, type(module))
+            return hacked_lora_forward.__get__(module, type(module))
 
-    for n, m in transformer.named_modules():
-        if hasattr(m, 'forward') and 'lora' in str(type(m)):
-            m.forward = create_hacked_forward(m)
+        for n, m in transformer.named_modules():
+            if hasattr(m, 'forward') and 'lora' in str(type(m)):
+                m.forward = create_hacked_forward(m)
+        logger.info("Hacks applied")
 
-    # New: Compile pipeline for mem efficiency (PyTorch 2.4+)
-    pipeline = torch.compile(pipeline, mode="reduce-overhead")  # ~20% mem savings; test for stability
+        # New: Compile pipeline for mem efficiency (PyTorch 2.4+)
+        pipeline = torch.compile(pipeline, mode="reduce-overhead")  # ~20% mem savings; test for stability
 
-    logger.info("Model loaded successfully")
+        logger.info("Model fully loaded—ready for inference!")
+    except Exception as e:
+        logger.error(f"Load failed: {e}. Verify paths: {args.model_root}, {args.lora_path}")
+        raise  # Or graceful fallback
 
 # Endpoint (lowered defaults; added final cleanup)
 @app.post("/tryon")
@@ -206,6 +231,9 @@ async def try_on(
         output_img = generate(person_image=person_pil, object_image=object_pil, object_class=object_class,
                               steps=steps, guidance_scale=guidance_scale, seed=seed)
         
+        # Save dims before del
+        width, height = output_img.width, output_img.height
+        
         buffered = io.BytesIO()
         output_img.save(buffered, format="PNG", optimize=True)  # Optimize for size
         buffered.seek(0)
@@ -224,8 +252,8 @@ async def try_on(
         return {
             "success": True,
             "image_base64": f"data:image/png;base64,{img_str}",
-            "width": output_img.width,  # Save dims before del
-            "height": output_img.height
+            "width": width,
+            "height": height
         }
     except ValueError as ve:
         logger.warning(f"Value error: {str(ve)}")
