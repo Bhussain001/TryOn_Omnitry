@@ -137,65 +137,27 @@ def generate(person_image, object_image, object_class, steps=20, guidance_scale=
     return img
 
 if __name__ == '__main__':
-    with gr.Blocks() as demo:
-        gr.Markdown('# Demo of OmniTry')
-        with gr.Row():
-            with gr.Column():
-                person_image = gr.Image(type="pil", label="Person Image", height=800)
-                run_button = gr.Button(value="Submit", variant='primary')
+    # New: Simple Interface for API (avoids Blocks schema bug; named "tryon" for /api/tryon)
+    iface = gr.Interface(
+        fn=generate,
+        inputs=[
+            gr.Image(type="pil", label="Person Image"),
+            gr.Image(type="pil", label="Object Image"),
+            gr.Dropdown(choices=list(args.object_map.keys()), label="Object Class"),
+            gr.Slider(minimum=1, maximum=50, value=20, label="Steps"),
+            gr.Slider(minimum=1, maximum=50, value=30, step=0.1, label="Guidance Scale"),
+            gr.Number(value=-1, label="Seed"),
+        ],
+        outputs=gr.Image(type="pil", label="Output"),
+        title="OmniTry Try-On API",
+        description="Upload images and class for virtual try-on. API at /api/tryon.",
+        api_name="tryon"  # Custom endpoint: /api/tryon
+    )
 
-            with gr.Column():
-                object_image = gr.Image(type="pil", label="Object Image", height=800)
-                object_class = gr.Dropdown(label='Object Class', choices=args.object_map.keys())
-
-            with gr.Column():
-                image_out = gr.Image(type="pil", label="Output", height=800)
-
-        with gr.Accordion("Advanced ⚙️", open=False):
-            guidance_scale = gr.Slider(label="Guidance scale", minimum=1, maximum=50, value=30, step=0.1)
-            steps = gr.Slider(label="Steps", minimum=1, maximum=50, value=20, step=1)
-            seed = gr.Number(label="Seed", value=-1, precision=0)
-
-        with gr.Row():
-            gr.Examples(
-                examples=[
-                    [
-                        './demo_example/person_top_cloth.jpg',
-                        './demo_example/object_top_cloth.jpg', 
-                        'top clothes',
-                    ],
-                    # ... other examples unchanged ...
-                ],
-
-                inputs=[person_image, object_image, object_class],
-                examples_per_page=100
-            )
-
-        # New: API Endpoint for Mobile (via Gradio's built-in API)
-        # Access at /api/tryon (POST with form: person_image, object_image, object_class, steps, guidance_scale, seed)
-        gr.Interface(
-            fn=generate,
-            inputs=[
-                gr.Image(type="pil", label="Person Image"),
-                gr.Image(type="pil", label="Object Image"),
-                gr.Dropdown(choices=args.object_map.keys(), label="Object Class"),
-                gr.Slider(minimum=1, maximum=50, value=20, label="Steps"),
-                gr.Slider(minimum=1, maximum=50, value=30, step=0.1, label="Guidance Scale"),
-                gr.Number(value=-1, label="Seed"),
-            ],
-            outputs=gr.Image(type="pil", label="Output"),
-            title="Try On API Endpoint",
-            api_name="tryon",  # Custom endpoint: /api/tryon
-            description="API for mobile integration: Send images/class via POST."
-        ).queue()  # Enables queuing for concurrent requests
-
-        run_button.click(generate, inputs=[person_image, object_image, object_class, steps, guidance_scale, seed], outputs=[image_out])
-    
-    # New: Launch with API enabled (share=True for public link; server_name="0.0.0.0" for external access)
-    demo.launch(
-        share=True,  # Generates public URL (e.g., https://xxxx.gradio.live) for mobile testing
-        server_name="0.0.0.0",  # Bind to all interfaces (for server/mobile access)
+    # Launch with queue for mobile concurrency; no show_api to avoid bug
+    iface.queue().launch(
+        share=True,  # Public URL for mobile
+        server_name="0.0.0.0",  # Accessible from network
         server_port=7860,
-        show_api=True,  # Enables full API docs at /docs
-        debug=True  # Logs for troubleshooting
+        debug=True  # Logs for errors
     )
