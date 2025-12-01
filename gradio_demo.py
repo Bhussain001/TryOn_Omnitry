@@ -25,8 +25,8 @@ args = OmegaConf.load('configs/omnitry_v1_unified.yaml')
 transformer = FluxTransformer2DModel.from_pretrained(f'{args.model_root}/transformer').requires_grad_(False).to(dtype=weight_dtype)
 pipeline = FluxFillPipeline.from_pretrained(args.model_root, transformer=transformer.eval(), torch_dtype=weight_dtype)
 
-# VRAM saving, comment the following lines if you have sufficient memory
-pipeline.enable_model_cpu_offload()
+# VRAM saving, use sequential offload for better stability on large models
+pipeline.enable_sequential_cpu_offload()
 pipeline.vae.enable_tiling()
 
 # insert LoRA
