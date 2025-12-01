@@ -36,7 +36,7 @@ transformer = FluxTransformer2DModel.from_pretrained(
     f'{args.model_root}/transformer',
     low_cpu_mem_usage=True,       # Help prevent temporary memory spikes
     local_files_only=True         # ENFORCE LOCAL FILES
-).requires_grad_(False).to(dtype=weight_dtype)
+).requires_grad_(False).to(device=device, dtype=weight_dtype)
 
 print("Loading Pipeline...")
 pipeline = FluxFillPipeline.from_pretrained(
@@ -72,6 +72,9 @@ with safe_open(args.lora_path, framework="pt") as f:
     lora_weights = {k: f.get_tensor(k) for k in f.keys()}
     transformer.load_state_dict(lora_weights, strict=False)
 
+# Move LoRA adapters to device after loading
+transformer.to(device)
+
 # hack lora forward
 def create_hacked_forward(module):
 
@@ -82,7 +85,8 @@ def create_hacked_forward(module):
             lora_B = self.lora_B[active_adapter]
             dropout = self.lora_dropout[active_adapter]
             scaling = self.scaling[active_adapter]
-            x = x.to(lora_A.weight.dtype)
+            # Ensure x is on the correct device and dtype for LoRA
+            x = x.to(device=lora_A.weight.device, dtype=lora_A.weight.dtype)
             result = result + lora_B(lora_A(dropout(x))) * scaling
         return result
     
@@ -181,7 +185,7 @@ if __name__ == '__main__':
         ],
         outputs=gr.Image(type="pil", label="Output"),
         title="OmniTry Try-On API",
-        description="Upload images and class for virtual try-on. API at /run/tryon.",
+        description="Upload images and class for virtual try-on. API at /gradio_api/api/tryon.",
         api_name="tryon"
     )
 
