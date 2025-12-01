@@ -5,7 +5,7 @@ os.environ["HF_OFFLINE"] = "1"
 os.environ["HF_HUB_DISABLE_DOWNLOAD_PROGRESS"] = "1"
 
 # CRITICAL: Advanced PyTorch Memory Configuration to fight fragmentation/stalls
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:128"
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:128"
 
 import gradio as gr
 import torch
