@@ -1,5 +1,10 @@
 import os
-# CRITICAL: Advanced PyTorch Memory Configuration to fight fragmentation
+# --- Global Environment Configuration ---
+# CRITICAL: Blocks all network requests to ensure local-only loading
+os.environ["HF_OFFLINE"] = "1" 
+os.environ["HF_HUB_DISABLE_DOWNLOAD_PROGRESS"] = "1"
+
+# CRITICAL: Advanced PyTorch Memory Configuration to fight fragmentation/stalls
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:128"
 
 import gradio as gr
@@ -15,26 +20,22 @@ import peft
 from peft import LoraConfig
 from safetensors import safe_open
 from omegaconf import OmegaConf
-
-# Local files only loading
-os.environ["HF_OFFLINE"] = "1"
 os.environ["GRADIO_TEMP_DIR"] = ".gradio"
 
-# Custom imports (ensure these are correctly installed)
 from omnitry.models.transformer_flux import FluxTransformer2DModel
 from omnitry.pipelines.pipeline_flux_fill import FluxFillPipeline
 
 # --- Configuration ---
-# Use float16 for lower VRAM usage, if bfloat16 causes issues
 device = torch.device('cuda:0')
-weight_dtype = torch.bfloat16 # Changed from bfloat16 for lower VRAM
+weight_dtype = torch.float16 # Using float16 for lower VRAM stability
 args = OmegaConf.load('configs/omnitry_v1_unified.yaml')
 
-# init model & pipeline (using low_cpu_mem_usage=True for stable loading)
+# init model & pipeline (with local_files_only=True)
 print("Loading Transformer...")
 transformer = FluxTransformer2DModel.from_pretrained(
     f'{args.model_root}/transformer',
-    low_cpu_mem_usage=True # Critical for smooth offload initialization
+    low_cpu_mem_usage=True,       # Help prevent temporary memory spikes
+    local_files_only=True         # ENFORCE LOCAL FILES
 ).requires_grad_(False).to(dtype=weight_dtype)
 
 print("Loading Pipeline...")
@@ -42,17 +43,17 @@ pipeline = FluxFillPipeline.from_pretrained(
     args.model_root, 
     transformer=transformer.eval(), 
     torch_dtype=weight_dtype,
-    low_cpu_mem_usage=True # Critical for smooth offload initialization
+    low_cpu_mem_usage=True,       # Help prevent temporary memory spikes
+    local_files_only=True         # ENFORCE LOCAL FILES
 )
 
 # VRAM saving, use sequential offload for better stability on large models
-# This moves layers one-by-one, reducing peak VRAM requirement during inference.
-pipeline.enable_sequential_cpu_offload() # Changed from enable_model_cpu_offload
+pipeline.enable_sequential_cpu_offload() # Use sequential for stability
 pipeline.vae.enable_tiling()
-pipeline.enable_vae_slicing() # Added VAE slicing for completeness
+pipeline.enable_vae_slicing()
 
 print("Inserting LoRA...")
-# insert LoRA (unchanged LoraConfig)
+# insert LoRA
 lora_config = LoraConfig(
     r=args.lora_rank,
     lora_alpha=args.lora_alpha,
@@ -71,13 +72,12 @@ with safe_open(args.lora_path, framework="pt") as f:
     lora_weights = {k: f.get_tensor(k) for k in f.keys()}
     transformer.load_state_dict(lora_weights, strict=False)
 
-# hack lora forward (UNCHANGED HACK LOGIC)
+# hack lora forward
 def create_hacked_forward(module):
 
     def lora_forward(self, active_adapter, x, *args, **kwargs):
         result = self.base_layer(x, *args, **kwargs)
         if active_adapter is not None:
-            # Type casting logic for bfloat16/float16 compatibility
             lora_A = self.lora_A[active_adapter]
             lora_B = self.lora_B[active_adapter]
             dropout = self.lora_dropout[active_adapter]
@@ -97,7 +97,7 @@ def create_hacked_forward(module):
 for n, m in transformer.named_modules():
     if isinstance(m, peft.tuners.lora.layer.Linear):
         m.forward = create_hacked_forward(m)
-print("LoRA adapters and custom forward hack applied.")
+print("Model fully configured.")
 
 # --- Helper Functions ---
 def seed_everything(seed=0):
@@ -114,7 +114,7 @@ def generate(person_image, object_image, object_class, steps=20, guidance_scale=
         seed = random.randint(0, 2**32 - 1)
     seed_everything(seed)
 
-    # --- Resizing Logic (Kept Original Dynamic Logic) ---
+    # resize model
     max_area = 1024 * 1024
     oW = person_image.width
     oH = person_image.height
@@ -157,7 +157,7 @@ def generate(person_image, object_image, object_class, steps=20, guidance_scale=
             num_inference_steps=steps,
             generator=torch.Generator(device).manual_seed(seed),
         ).images[0]
-    
+
     # Explicit cleanup
     del img_cond, mask, person_image, object_image_padded
     torch.cuda.empty_cache()
