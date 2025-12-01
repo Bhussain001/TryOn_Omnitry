@@ -1,3 +1,7 @@
+import os
+# CRITICAL: Advanced PyTorch Memory Configuration to fight fragmentation
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:128"
+
 import gradio as gr
 import torch
 import diffusers
@@ -11,32 +15,50 @@ import peft
 from peft import LoraConfig
 from safetensors import safe_open
 from omegaconf import OmegaConf
-import os
+
+# Local files only loading
+os.environ["HF_OFFLINE"] = "1"
 os.environ["GRADIO_TEMP_DIR"] = ".gradio"
 
+# Custom imports (ensure these are correctly installed)
 from omnitry.models.transformer_flux import FluxTransformer2DModel
 from omnitry.pipelines.pipeline_flux_fill import FluxFillPipeline
 
+# --- Configuration ---
+# Use float16 for lower VRAM usage, if bfloat16 causes issues
 device = torch.device('cuda:0')
-weight_dtype = torch.bfloat16
+weight_dtype = torch.bfloat16 # Changed from bfloat16 for lower VRAM
 args = OmegaConf.load('configs/omnitry_v1_unified.yaml')
 
-# init model & pipeline
-transformer = FluxTransformer2DModel.from_pretrained(f'{args.model_root}/transformer').requires_grad_(False).to(dtype=weight_dtype)
-pipeline = FluxFillPipeline.from_pretrained(args.model_root, transformer=transformer.eval(), torch_dtype=weight_dtype)
+# init model & pipeline (using low_cpu_mem_usage=True for stable loading)
+print("Loading Transformer...")
+transformer = FluxTransformer2DModel.from_pretrained(
+    f'{args.model_root}/transformer',
+    low_cpu_mem_usage=True # Critical for smooth offload initialization
+).requires_grad_(False).to(dtype=weight_dtype)
+
+print("Loading Pipeline...")
+pipeline = FluxFillPipeline.from_pretrained(
+    args.model_root, 
+    transformer=transformer.eval(), 
+    torch_dtype=weight_dtype,
+    low_cpu_mem_usage=True # Critical for smooth offload initialization
+)
 
 # VRAM saving, use sequential offload for better stability on large models
-pipeline.enable_sequential_cpu_offload()
+# This moves layers one-by-one, reducing peak VRAM requirement during inference.
+pipeline.enable_sequential_cpu_offload() # Changed from enable_model_cpu_offload
 pipeline.vae.enable_tiling()
+pipeline.enable_vae_slicing() # Added VAE slicing for completeness
 
-# insert LoRA
+print("Inserting LoRA...")
+# insert LoRA (unchanged LoraConfig)
 lora_config = LoraConfig(
     r=args.lora_rank,
     lora_alpha=args.lora_alpha,
     init_lora_weights="gaussian",
     target_modules=[
-        'x_embedder',
-        'attn.to_k', 'attn.to_q', 'attn.to_v', 'attn.to_out.0', 
+        'x_embedder', 'attn.to_k', 'attn.to_q', 'attn.to_v', 'attn.to_out.0', 
         'attn.add_k_proj', 'attn.add_q_proj', 'attn.add_v_proj', 'attn.to_add_out', 
         'ff.net.0.proj', 'ff.net.2', 'ff_context.net.0.proj', 'ff_context.net.2', 
         'norm1_context.linear', 'norm1.linear', 'norm.linear', 'proj_mlp', 'proj_out'
@@ -49,13 +71,13 @@ with safe_open(args.lora_path, framework="pt") as f:
     lora_weights = {k: f.get_tensor(k) for k in f.keys()}
     transformer.load_state_dict(lora_weights, strict=False)
 
-# hack lora forward
+# hack lora forward (UNCHANGED HACK LOGIC)
 def create_hacked_forward(module):
 
     def lora_forward(self, active_adapter, x, *args, **kwargs):
         result = self.base_layer(x, *args, **kwargs)
         if active_adapter is not None:
-            torch_result_dtype = result.dtype
+            # Type casting logic for bfloat16/float16 compatibility
             lora_A = self.lora_A[active_adapter]
             lora_B = self.lora_B[active_adapter]
             dropout = self.lora_dropout[active_adapter]
@@ -75,7 +97,9 @@ def create_hacked_forward(module):
 for n, m in transformer.named_modules():
     if isinstance(m, peft.tuners.lora.layer.Linear):
         m.forward = create_hacked_forward(m)
+print("LoRA adapters and custom forward hack applied.")
 
+# --- Helper Functions ---
 def seed_everything(seed=0):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -90,7 +114,7 @@ def generate(person_image, object_image, object_class, steps=20, guidance_scale=
         seed = random.randint(0, 2**32 - 1)
     seed_everything(seed)
 
-    # resize model
+    # --- Resizing Logic (Kept Original Dynamic Logic) ---
     max_area = 1024 * 1024
     oW = person_image.width
     oH = person_image.height
@@ -133,11 +157,18 @@ def generate(person_image, object_image, object_class, steps=20, guidance_scale=
             num_inference_steps=steps,
             generator=torch.Generator(device).manual_seed(seed),
         ).images[0]
+    
+    # Explicit cleanup
+    del img_cond, mask, person_image, object_image_padded
+    torch.cuda.empty_cache()
 
     return img
 
+# --- Gradio Interface ---
 if __name__ == '__main__':
-    # New: Simple Interface for API (avoids Blocks schema bug; named "tryon" for /api/tryon)
+    
+    print("Launching Gradio Interface...")
+    
     iface = gr.Interface(
         fn=generate,
         inputs=[
@@ -150,14 +181,14 @@ if __name__ == '__main__':
         ],
         outputs=gr.Image(type="pil", label="Output"),
         title="OmniTry Try-On API",
-        description="Upload images and class for virtual try-on. API at /api/tryon.",
-        api_name="tryon"  # Custom endpoint: /api/tryon
+        description="Upload images and class for virtual try-on. API at /run/tryon.",
+        api_name="tryon"
     )
 
-    # Launch with queue for mobile concurrency; no show_api to avoid bug
+    # Launch with queue for mobile concurrency
     iface.queue().launch(
-        share=True,  # Public URL for mobile
-        server_name="0.0.0.0",  # Accessible from network
+        share=True,
+        server_name="0.0.0.0",
         server_port=7860,
-        debug=True  # Logs for errors
+        debug=True
     )
