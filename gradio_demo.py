@@ -47,11 +47,6 @@ pipeline = FluxFillPipeline.from_pretrained(
     local_files_only=True         # ENFORCE LOCAL FILES
 )
 
-# VRAM saving, use sequential offload for better stability on large models
-pipeline.enable_sequential_cpu_offload() # Use sequential for stability
-pipeline.vae.enable_tiling()
-pipeline.enable_vae_slicing()
-
 print("Inserting LoRA...")
 # insert LoRA
 lora_config = LoraConfig(
@@ -67,6 +62,24 @@ lora_config = LoraConfig(
 )
 transformer.add_adapter(lora_config, adapter_name='vtryon_lora')
 transformer.add_adapter(lora_config, adapter_name='garment_lora')
+
+# Materialize meta LoRA parameters on CPU to enable proper weight loading (non-meta)
+for n, m in transformer.named_modules():
+    if isinstance(m, peft.tuners.lora.layer.Linear):
+        for adapter in ['vtryon_lora', 'garment_lora']:
+            if adapter in m.lora_A:  # Check if adapter exists for this layer
+                for lora_layer in [m.lora_A, m.lora_B]:
+                    param = lora_layer[adapter].weight  # Target the weight param specifically
+                    if param.is_meta:
+                        with torch.no_grad():
+                            # Create real CPU tensor (safetensors loads to CPU anyway)
+                            param.data = torch.zeros(param.shape, dtype=param.dtype, device='cpu')
+                    # Also handle bias if present (rare for LoRA, but complete)
+                    if hasattr(lora_layer[adapter], 'bias') and lora_layer[adapter].bias is not None:
+                        bias = lora_layer[adapter].bias
+                        if bias.is_meta:
+                            with torch.no_grad():
+                                bias.data = torch.zeros(bias.shape, dtype=bias.dtype, device='cpu')
 
 with safe_open(args.lora_path, framework="pt") as f:
     lora_weights = {k: f.get_tensor(k) for k in f.keys()}
@@ -98,6 +111,11 @@ for n, m in transformer.named_modules():
     if isinstance(m, peft.tuners.lora.layer.Linear):
         m.forward = create_hacked_forward(m)
 print("Model fully configured.")
+
+# VRAM saving: Enable offload AFTER LoRA (now registers LoRA params too)
+pipeline.enable_sequential_cpu_offload() # Use sequential for stability
+pipeline.vae.enable_tiling()
+pipeline.enable_vae_slicing()
 
 # --- Helper Functions ---
 def seed_everything(seed=0):
