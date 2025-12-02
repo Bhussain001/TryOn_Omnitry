@@ -20,7 +20,7 @@ import peft
 from peft import LoraConfig
 from safetensors import safe_open
 from omegaconf import OmegaConf
-from accelerate import init_empty_weights, load_checkpoint_and_dispatch  # ADD: For low-mem loading
+from accelerate import init_empty_weights, load_checkpoint_and_dispatch  # For low-mem loading
 os.environ["GRADIO_TEMP_DIR"] = ".gradio"
 
 from omnitry.models.transformer_flux import FluxTransformer2DModel
@@ -49,7 +49,6 @@ transformer = load_checkpoint_and_dispatch(
     dtype=weight_dtype,
     offload_folder="offload_tmp",  # Temp CPU cache (auto-deletes)
     max_memory={0: "20GiB", "cpu": "32GiB"},  # Cap GPU; spill to CPU (adjust RAM if needed)
-    low_cpu_mem_usage=True
 )
 transformer.requires_grad_(False)
 transformer.eval()
@@ -97,7 +96,6 @@ transformer = load_checkpoint_and_dispatch(
     dtype=weight_dtype,
     offload_folder="offload_tmp",
     max_memory={0: "20GiB", "cpu": "32GiB"},
-    low_cpu_mem_usage=True
 )
 
 # hack lora forward
