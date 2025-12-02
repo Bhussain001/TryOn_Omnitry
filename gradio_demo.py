@@ -27,7 +27,7 @@ from omnitry.pipelines.pipeline_flux_fill import FluxFillPipeline
 
 # --- Configuration ---
 device = torch.device('cuda:0')
-weight_dtype = torch.float16 # Using float16 for lower VRAM stability
+weight_dtype = torch.bfloat16 # Converted to bfloat16 for improved numerical stability in Flux
 args = OmegaConf.load('configs/omnitry_v1_unified.yaml')
 
 # init model & pipeline (with local_files_only=True)
