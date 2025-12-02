@@ -5,7 +5,7 @@ os.environ["HF_OFFLINE"] = "1"
 os.environ["HF_HUB_DISABLE_DOWNLOAD_PROGRESS"] = "1"
 
 # CRITICAL: Advanced PyTorch Memory Configuration to fight fragmentation/stalls
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:128"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:128"
 
 import gradio as gr
 import torch
@@ -20,7 +20,6 @@ import peft
 from peft import LoraConfig
 from safetensors import safe_open
 from omegaconf import OmegaConf
-from accelerate import init_empty_weights, load_checkpoint_and_dispatch  # For low-mem loading
 os.environ["GRADIO_TEMP_DIR"] = ".gradio"
 
 from omnitry.models.transformer_flux import FluxTransformer2DModel
@@ -28,44 +27,29 @@ from omnitry.pipelines.pipeline_flux_fill import FluxFillPipeline
 
 # --- Configuration ---
 device = torch.device('cuda:0')
-weight_dtype = torch.float16  # Or torch.bfloat16 for Ampere+ GPUs
+weight_dtype = torch.float16 # Using float16 for lower VRAM stability
 args = OmegaConf.load('configs/omnitry_v1_unified.yaml')
 
-print("Loading Transformer with Accelerate low-mem dispatch...")
-# Step 1: Init empty model (0 VRAM/RAM usage)
-with init_empty_weights():
-    transformer = FluxTransformer2DModel.from_pretrained(
-        f'{args.model_root}/transformer',
-        low_cpu_mem_usage=True,
-        local_files_only=True
-    )
-
-# Step 2: Dispatch shards sequentially (low peak mem)
-device_map = "auto"  # Balances GPU/CPU; or "sequential" for strict offload
-transformer = load_checkpoint_and_dispatch(
-    transformer,
-    checkpoint=f'{args.model_root}/transformer',
-    device_map=device_map,
-    dtype=weight_dtype,
-    offload_folder="offload_tmp",  # Temp CPU cache (auto-deletes)
-    max_memory={0: "20GiB", "cpu": "32GiB"},  # Cap GPU; spill to CPU (adjust RAM if needed)
-)
-transformer.requires_grad_(False)
-transformer.eval()
+# init model & pipeline (with local_files_only=True)
+print("Loading Transformer...")
+transformer = FluxTransformer2DModel.from_pretrained(
+    f'{args.model_root}/transformer',
+    low_cpu_mem_usage=True,       # Help prevent temporary memory spikes
+    local_files_only=True         # ENFORCE LOCAL FILES
+).requires_grad_(False).to(dtype=weight_dtype)
 
 print("Loading Pipeline...")
 pipeline = FluxFillPipeline.from_pretrained(
     args.model_root, 
-    transformer=transformer,  # Inherits dispatched state
+    transformer=transformer.eval(), 
     torch_dtype=weight_dtype,
-    low_cpu_mem_usage=True,       
-    local_files_only=True         
+    low_cpu_mem_usage=True,       # Help prevent temporary memory spikes
+    local_files_only=True         # ENFORCE LOCAL FILES
 )
 
-# Enable offloads EARLY (now model is dispatched)
-pipeline.enable_sequential_cpu_offload(device_map=device_map)
-pipeline.enable_model_cpu_offload()  # Offload inactive components
-pipeline.vae.enable_tiling(tile_size=512)  # Chunk VAE (saves 2-4GB)
+# VRAM saving, use sequential offload for better stability on large models
+pipeline.enable_sequential_cpu_offload() # Use sequential for stability
+pipeline.vae.enable_tiling()
 pipeline.enable_vae_slicing()
 
 print("Inserting LoRA...")
@@ -88,16 +72,6 @@ with safe_open(args.lora_path, framework="pt") as f:
     lora_weights = {k: f.get_tensor(k) for k in f.keys()}
     transformer.load_state_dict(lora_weights, strict=False)
 
-# LoRA dispatch: Reload with Accelerate to move adapters (handles offload)
-transformer = load_checkpoint_and_dispatch(
-    transformer,
-    checkpoint=f'{args.model_root}/transformer',  # Reuse base (adapters added in-place)
-    device_map=device_map,
-    dtype=weight_dtype,
-    offload_folder="offload_tmp",
-    max_memory={0: "20GiB", "cpu": "32GiB"},
-)
-
 # hack lora forward
 def create_hacked_forward(module):
 
@@ -108,14 +82,11 @@ def create_hacked_forward(module):
             lora_B = self.lora_B[active_adapter]
             dropout = self.lora_dropout[active_adapter]
             scaling = self.scaling[active_adapter]
-            # Ensure x is on the correct device and dtype for LoRA
-            x = x.to(device=lora_A.weight.device, dtype=lora_A.weight.dtype)
+            x = x.to(lora_A.weight.dtype)
             result = result + lora_B(lora_A(dropout(x))) * scaling
         return result
     
     def hacked_lora_forward(self, x, *args, **kwargs):
-        # Pre-align x to base device
-        x = x.to(device=module.base_layer.weight.device, dtype=module.base_layer.weight.dtype)
         return torch.cat((
             lora_forward(self, 'vtryon_lora', x[:1], *args, **kwargs),
             lora_forward(self, 'garment_lora', x[1:], *args, **kwargs),
@@ -143,8 +114,8 @@ def generate(person_image, object_image, object_class, steps=20, guidance_scale=
         seed = random.randint(0, 2**32 - 1)
     seed_everything(seed)
 
-    # resize model (LOWER RES FOR TESTING: 512x512 max to save VRAM)
-    max_area = 512 * 512  # TEMP: Reduce for OOM testing; revert to 1024*1024 later
+    # resize model
+    max_area = 1024 * 1024
     oW = person_image.width
     oH = person_image.height
 
@@ -210,7 +181,7 @@ if __name__ == '__main__':
         ],
         outputs=gr.Image(type="pil", label="Output"),
         title="OmniTry Try-On API",
-        description="Upload images and class for virtual try-on. API at /gradio_api/api/tryon.",
+        description="Upload images and class for virtual try-on. API at /run/tryon.",
         api_name="tryon"
     )
 
